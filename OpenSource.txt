@@ -1,0 +1,209 @@
+import tkinter as tk
+from tkinter import messagebox
+import math, time, json, os, sys, urllib.request, threading, traceback
+
+
+BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+LB_FILE = os.path.join(BASE_DIR, "records.json")
+
+MAX_SPEED, REVERSE_SPEED, ACCELERATION, BRAKE_FORCE, FRICTION, TURN_SPEED, DRIFT_GRIP = 9.0, -4.5, 0.35, 0.55, 0.96, 4.2, 0.88
+BORDERS = [(0.0,0.0,1.0,0.03), (0.0,0.97,1.0,1.0), (0.0,0.0,0.02,1.0), (0.98,0.0,1.0,1.0)]
+
+LEVELS = [
+    {"start": (0.075, 0.095), "finish": (0.89, 0.86, 0.97, 0.95), "walls": [(0.02,0.18,0.75,0.22), (0.25,0.40,0.98,0.44), (0.02,0.62,0.75,0.66), (0.25,0.82,0.85,0.86)]},
+    {"start": (0.075, 0.095), "finish": (0.89, 0.87, 0.97, 0.95), "walls": [(0.02,0.16,0.35,0.19), (0.43,0.03,0.46,0.35), (0.12,0.32,0.43,0.35), (0.12,0.35,0.15,0.65), (0.02,0.78,0.28,0.81), (0.25,0.48,0.28,0.78), (0.28,0.48,0.55,0.51), (0.38,0.65,0.41,0.97), (0.52,0.16,0.55,0.48), (0.55,0.16,0.85,0.19), (0.65,0.32,0.98,0.35), (0.65,0.35,0.68,0.80), (0.50,0.65,0.65,0.68), (0.50,0.68,0.53,0.85), (0.53,0.82,0.82,0.85), (0.79,0.48,0.82,0.82), (0.82,0.48,0.90,0.51), (0.88,0.62,0.98,0.65)]},
+    {"start": (0.075, 0.095), "finish": (0.46, 0.45, 0.54, 0.55), "walls": [(0.02,0.16,0.86,0.19), (0.83,0.19,0.86,0.84), (0.14,0.81,0.83,0.84), (0.14,0.31,0.17,0.81), (0.17,0.31,0.71,0.34), (0.68,0.34,0.71,0.68), (0.29,0.65,0.68,0.68), (0.29,0.45,0.32,0.65)]},
+    {"start": (0.07, 0.88), "finish": (0.90, 0.05, 0.97, 0.14), "walls": [(0.14,0.18,0.17,0.97), (0.29,0.03,0.32,0.80), (0.44,0.18,0.47,0.97), (0.59,0.03,0.62,0.80), (0.74,0.18,0.77,0.97), (0.86,0.18,0.98,0.21), (0.77,0.55,0.88,0.58)]},
+       {"start": (0.07, 0.095), "finish": (0.90, 0.87, 0.97, 0.95), "walls": [(0.14,0.03,0.17,0.72), (0.02,0.84,0.32,0.87), (0.29,0.20,0.32,0.84), (0.43,0.03,0.46,0.65), (0.32,0.77,0.60,0.80), (0.57,0.20,0.60,0.77), (0.71,0.03,0.74,0.82), (0.60,0.82,0.86,0.85), (0.83,0.20,0.86,0.82), (0.86,0.50,0.92,0.53), (0.91,0.68,0.98,0.71)]}
+]
+
+class DriftMazeGame:
+    def __init__(self, root):
+        self.root = root; self.root.title("Drift Maze"); self.is_fs = True
+        self.root.attributes("-fullscreen", True); self.root.geometry("1280x720")
+        self.root.bind("<F11>", self.toggle_fs)
+        self.player_name, self.paused, self.finished, self.level_idx = "Игрок", False, False, 0
+        self.noclip, self.admin_panel = False, None
+        self.show_start_menu()
+
+    def toggle_fs(self, e=None):
+        self.is_fs = not self.is_fs; self.root.attributes("-fullscreen", self.is_fs)
+        if hasattr(self, "canvas") and self.canvas.winfo_exists(): self.root.after(50, lambda: self.load_level(self.level_idx))
+    def fetch_scores(self):
+        if CLOUD_URL and CLOUD_API_KEY:
+            try:
+                req = urllib.request.Request(CLOUD_URL + "/latest", headers={"X-Master-Key": CLOUD_API_KEY})
+                with urllib.request.urlopen(req, timeout=5) as r: return json.loads(r.read().decode("utf-8")).get("record", {}).get("scores", [])
+            except Exception: pass
+        if os.path.exists(LB_FILE):
+            try:
+                with open(LB_FILE, "r", encoding="utf-8") as f: return json.load(f)
+            except Exception: pass
+        return []
+
+    def submit_score(self, name, sec, crashes):
+        scores = self.fetch_scores()
+        scores.append({"name": name, "time": round(sec, 2), "crashes": crashes})
+        scores.sort(key=lambda x: (x["time"], x["crashes"]))
+        scores = scores[:15]
+        if CLOUD_URL and CLOUD_API_KEY:
+            try:
+                req = urllib.request.Request(CLOUD_URL, data=json.dumps({"scores": scores}).encode("utf-8"), method="PUT", headers={"Content-Type": "application/json", "X-Master-Key": CLOUD_API_KEY})
+                urllib.request.urlopen(req, timeout=5)
+            except Exception: pass
+        try:
+            with open(LB_FILE, "w", encoding="utf-8") as f: json.dump(scores, f, ensure_ascii=False, indent=2)
+        except Exception: pass
+        return scores
+
+    def show_start_menu(self):
+        self.menu = tk.Frame(self.root, bg="#161C22"); self.menu.place(x=0, y=0, relwidth=1, relheight=1)
+        tk.Button(self.menu, text="🏆 РЕКОРДЫ", font=("Arial", 13, "bold"), bg="#2F3640", fg="#FFD700", bd=0, padx=16, pady=8, cursor="hand2", command=lambda: self.open_trophy(False)).place(relx=1.0, x=-30, y=25, anchor="ne")
+        box = tk.Frame(self.menu, bg="#1E272E", padx=45, pady=35); box.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(box, text="DRIFT MAZE", font=("Arial", 28, "bold"), bg="#1E272E", fg="#00D2D3").pack(pady=(0, 6))
+        tk.Label(box, text="WASD / Стрелки — вождение   |   F11 — окно / полный экран", font=("Arial", 11), bg="#1E272E", fg="#A4B0BE").pack(pady=(0, 22))
+        tk.Label(box, text="Введите ваш никнейм:", font=("Arial", 13), bg="#1E272E", fg="white").pack(anchor="w")
+        ent = tk.Entry(box, font=("Arial", 16), bg="#2F3640", fg="white", insertbackground="white", bd=0, width=24, justify="center")
+        ent.pack(ipady=8, pady=(6, 20), fill="x"); ent.focus_force()
+        def start(e=None): self.player_name = ent.get().strip() or "Игрок"; self.menu.destroy(); self.init_game()
+        ent.bind("<Return>", start)
+        tk.Button(box, text="НАЧАТЬ ЗАЕЗД", font=("Arial", 14, "bold"), bg="#27AE60", fg="white", bd=0, pady=12, cursor="hand2", command=start).pack(fill="x")
+
+    def init_game(self):
+        self.canvas = tk.Canvas(self.root, bg="#ECF0F1", highlightthickness=0); self.canvas.pack(fill="both", expand=True)
+        self.keys = set()
+        self.root.bind("<KeyPress>", self.on_key_down)
+        self.root.bind("<KeyRelease>", lambda e: self.keys.discard(e.keycode))
+        self.start_new_run(); self.game_loop()
+
+    def on_key_down(self, e):
+        if e.char.lower() == "щ" or e.keycode == 79:
+            self.toggle_admin_menu(); return
+        if not (self.finished or self.paused): self.keys.add(e.keycode)
+
+    def toggle_admin_menu(self):
+        if self.admin_panel and self.admin_panel.winfo_exists():
+            self.admin_panel.destroy(); self.admin_panel = None; return
+        self.admin_panel = tk.Frame(self.root, bg="#1E272E", padx=18, pady=15, highlightbackground="#00D2D3", highlightthickness=2)
+        self.admin_panel.place(x=35, y=35)
+        tk.Label(self.admin_panel, text="ADMIN PANEL", font=("Arial", 12, "bold"), bg="#1E272E", fg="#00D2D3").pack(pady=(0, 10))
+        nc_btn = tk.Button(self.admin_panel, text=f"Ноуклип: {'ВКЛ' if self.noclip else 'ВЫКЛ'}", font=("Arial", 11, "bold"), bg="#27AE60" if self.noclip else "#E74C3C", fg="white", bd=0, width=20, pady=6, cursor="hand2")
+        def switch_noclip():
+            self.noclip = not self.noclip
+            nc_btn.config(text=f"Ноуклип: {'ВКЛ' if self.noclip else 'ВЫКЛ'}", bg="#27AE60" if self.noclip else "#E74C3C")
+            self.draw_car()
+        nc_btn.config(command=switch_noclip); nc_btn.pack(pady=4)
+        tk.Button(self.admin_panel, text="Следующий уровень >>", font=("Arial", 11), bg="#2F3640", fg="white", bd=0, width=20, pady=6, cursor="hand2", command=self.next_level).pack(pady=4)
+        tk.Button(self.admin_panel, text="Обнулить таймер (0.0)", font=("Arial", 11), bg="#2F3640", fg="white", bd=0, width=20, pady=6, cursor="hand2", command=lambda: setattr(self, "elapsed_time", 0.0)).pack(pady=4)
+    def start_new_run(self):
+        self.finished, self.paused, self.level_idx, self.crashes = False, False, 0, 0
+        self.elapsed_time, self.last_tick = 0.0, time.time()
+        self.root.update_idletasks(); self.load_level(0); self.root.focus_force()
+
+    def load_level(self, idx):
+        self.w, self.h = max(self.canvas.winfo_width(), 800), max(self.canvas.winfo_height(), 600)
+        self.canvas.delete("all"); self.keys.clear(); lvl = LEVELS[idx]
+        for x1, y1, x2, y2 in BORDERS + lvl["walls"]:
+            self.canvas.create_rectangle(self.w*x1, self.h*y1, self.w*x2, self.h*y2, fill="#2C3E50", outline="", tags="wall")
+        sx_r, sy_r = lvl["start"]
+        self.sx, self.sy = self.w * sx_r, self.h * sy_r
+        self.canvas.create_rectangle(self.sx-self.w*0.045, self.sy-self.h*0.05, self.sx+self.w*0.045, self.sy+self.h*0.05, fill="#27AE60", outline="", tags="start")
+        self.canvas.create_text(self.sx, self.sy, text="СТАРТ", fill="white", font=("Arial", 11, "bold"))
+        fx1, fy1, fx2, fy2 = lvl["finish"]
+        self.canvas.create_rectangle(self.w*fx1, self.h*fy1, self.w*fx2, self.h*fy2, fill="#E74C3C", outline="", tags="finish")
+        self.canvas.create_text(self.w*(fx1+fx2)/2, self.h*(fy1+fy2)/2, text="ФИНИШ", fill="white", font=("Arial", 11, "bold"))
+        self.canvas.create_rectangle(self.w-255, 28, self.w-25, 115, fill="#1E272E", outline="#2C3E50", width=2)
+        self.canvas.create_text(self.w-180, 52, text=f"{idx}/{len(LEVELS)}", fill="#00D2D3", font=("Arial", 20, "bold"))
+        self.timer_text = self.canvas.create_text(self.w-180, 86, text=f"{self.elapsed_time:.1f} с", fill="#FECA57", font=("Arial", 14, "bold"))
+        t_btn = tk.Button(self.root, text="🏆", font=("Arial", 22), bg="#2F3640", fg="#FFD700", bd=0, width=3, cursor="hand2", command=lambda: self.open_trophy(False))
+        self.canvas.create_window(self.w-70, 71, window=t_btn)
+        self.reset_car()
+
+    def reset_car(self): self.cx, self.cy, self.vx, self.vy, self.ang = self.sx, self.sy, 0.0, 0.0, 0.0; self.draw_car()
+
+    def rot(self, pts):
+        r = math.radians(self.ang); c, s = math.cos(r), math.sin(r); res = []
+        for px, py in pts: res.extend([self.cx + px*c - py*s, self.cy + px*s + py*c])
+        return res
+
+    def draw_car(self):
+        self.canvas.delete("car")
+        for wp in [[(-20,-18),(-8,-18),(-8,-13),(-20,-13)], [(-20,13),(-8,13),(-8,18),(-20,18)], [(10,-18),(22,-18),(22,-13),(10,-13)], [(10,13),(22,13),(22,18),(10,18)]]:
+            self.canvas.create_polygon(self.rot(wp), fill="#111", outline="", tags="car")
+        self.canvas.create_polygon(self.rot([(-28,-15),(24,-15),(28,-10),(28,10),(24,15),(-28,15)]), fill="#FF2A2A", outline="#00D2D3" if self.noclip else "#8B0000", width=2, tags="car")
+        self.canvas.create_polygon(self.rot([(4,-3),(26,-3),(26,3),(4,3)]), fill="#00D2D3" if self.noclip else "#FFF", outline="", tags="car")
+        self.canvas.create_polygon(self.rot([(-14,-11),(6,-11),(10,-8),(10,8),(6,11),(-14,11)]), fill="#2C3E50", outline="", tags="car")
+        self.canvas.create_polygon(self.rot([(-29,-16),(-24,-16),(-24,16),(-29,16)]), fill="#900000", outline="", tags="car")
+        for hl in [[(25,-12),(28,-12),(28,-6),(25,-6)], [(25,6),(28,6),(28,12),(25,12)]]:
+            self.canvas.create_polygon(self.rot(hl), fill="#FFF200", outline="", tags="car")
+
+    def game_loop(self):
+        now = time.time()
+        if not self.finished and not self.paused:
+            self.elapsed_time += now - self.last_tick
+            self.canvas.itemconfig(self.timer_text, text=f"{self.elapsed_time:.1f} с")
+            r = math.radians(self.ang); fx, fy = math.cos(r), math.sin(r); fs = self.vx * fx + self.vy * fy
+            if (87 in self.keys or 38 in self.keys) and fs < MAX_SPEED: self.vx += fx * ACCELERATION; self.vy += fy * ACCELERATION
+            if (83 in self.keys or 40 in self.keys) and fs > REVERSE_SPEED:
+                f = BRAKE_FORCE if fs > 0 else ACCELERATION * 0.7; self.vx -= fx * f; self.vy -= fy * f
+            spd = math.hypot(self.vx, self.vy)
+            if spd > 0.3:
+                ts = min(spd / 3.5, 1.0) * TURN_SPEED * (1 if fs >= -0.1 else -1)
+                if 65 in self.keys or 37 in self.keys: self.ang -= ts
+                if 68 in self.keys or 39 in self.keys: self.ang += ts
+            rx, ry = -fy, fx; ls = self.vx * rx + self.vy * ry
+            self.vx = (self.vx - rx * ls * (1.0 - DRIFT_GRIP)) * FRICTION; self.vy = (self.vy - ry * ls * (1.0 - DRIFT_GRIP)) * FRICTION
+            if spd < 0.05 and not self.keys: self.vx = self.vy = 0.0
+            self.cx += self.vx; self.cy += self.vy; self.draw_car()
+            for item in self.canvas.find_overlapping(self.cx-16, self.cy-16, self.cx+16, self.cy+16):
+                tags = self.canvas.gettags(item)
+                if "wall" in tags and not self.noclip:
+                    self.crashes += 1; self.canvas.config(bg="#FADBD8")
+                    self.root.after(120, lambda: self.canvas.config(bg="#ECF0F1") if self.canvas.winfo_exists() else None)
+                    self.reset_car(); break
+                elif "finish" in tags: self.next_level(); break
+        self.last_tick = now; self.root.after(16, self.game_loop)
+
+    def next_level(self):
+        self.level_idx += 1
+        if self.level_idx < len(LEVELS): self.load_level(self.level_idx)
+        else: self.finished = True; self.keys.clear(); self.vx = self.vy = 0.0; self.open_trophy(True)
+
+    def open_trophy(self, just_finished=False):
+        if self.paused and not just_finished: return
+        self.paused = True; self.keys.clear()
+        ov = tk.Frame(self.root, bg="#121212"); ov.place(x=0, y=0, relwidth=1, relheight=1)
+        box = tk.Frame(ov, bg="#1E272E", padx=40, pady=30); box.place(relx=0.5, rely=0.5, anchor="center")
+        if just_finished:
+            tk.Label(box, text="🏆 ФИНИШ! ВСЕ 5 УРОВНЕЙ ПРОЙДЕНЫ (5/5)", font=("Arial", 20, "bold"), bg="#1E272E", fg="#2ECC71").pack(pady=(0, 6))
+            tk.Label(box, text=f"{self.player_name}: {self.elapsed_time:.2f} сек.   |   Аварий: {self.crashes}", font=("Arial", 14, "bold"), bg="#1E272E", fg="#FECA57").pack(pady=(0, 15))
+        else:
+            tk.Label(box, text="🏆 ТАБЛИЦА РЕКОРДОВ ИГРОКОВ", font=("Arial", 22, "bold"), bg="#1E272E", fg="#FFD700").pack(pady=(0, 15))
+        tf = tk.Frame(box, bg="#161C22", padx=25, pady=15); tf.pack(fill="x", pady=(0, 20))
+        tk.Label(tf, text="Загрузка рекордов...", font=("Arial", 12), bg="#161C22", fg="#A4B0BE").pack()
+
+        def worker():
+            scores = self.submit_score(self.player_name, self.elapsed_time, self.crashes) if just_finished else self.fetch_scores()
+            if tf.winfo_exists(): self.root.after(0, lambda: render(scores))
+
+        def render(scores):
+            if not tf.winfo_exists(): return
+            for w in tf.winfo_children(): w.destroy()
+            if not scores:
+                tk.Label(tf, text="Пока никто не прошёл все 5 уровней. Стань первым!", font=("Arial", 12), bg="#161C22", fg="#888").pack(); return
+            for i, s in enumerate(scores[:10], 1):
+                me = just_finished and s["name"] == self.player_name and abs(s["time"] - round(self.elapsed_time, 2)) < 0.01
+                col = "#00D2D3" if me else ("#FFD700" if i == 1 else ("#C0C0C0" if i == 2 else ("#CD7F32" if i == 3 else "#ECF0F1")))
+                tk.Label(tf, text=f"#{i:<2}   {s['name']:<16}   {s['time']:>6.2f} сек.   (аварий: {s['crashes']})", font=("Consolas", 13, "bold" if (i <= 3 or me) else "normal"), bg="#161C22", fg=col, anchor="w").pack(fill="x", pady=2)
+
+        threading.Thread(target=worker, daemon=True).start()
+        btn_row = tk.Frame(box, bg="#1E272E"); btn_row.pack()
+        if just_finished:
+            tk.Button(btn_row, text="ИГРАТЬ СНОВА", font=("Arial", 12, "bold"), bg="#27AE60", fg="white", bd=0, padx=18, pady=10, cursor="hand2", command=lambda: (ov.destroy(), self.start_new_run())).pack(side="left", padx=8)
+            tk.Button(btn_row, text="ВЫЙТИ", font=("Arial", 12, "bold"), bg="#E74C3C", fg="white", bd=0, padx=18, pady=10, cursor="hand2", command=self.root.destroy).pack(side="left", padx=8)
+        else:
+            tk.Button(btn_row, text="ЗАКРЫТЬ", font=("Arial", 12, "bold"), bg="#0A84FF", fg="white", bd=0, padx=22, pady=10, cursor="hand2", command=lambda: (ov.destroy(), setattr(self, "paused", False), setattr(self, "last_tick", time.time()), self.root.focus_force())).pack()
+
+if __name__ == "__main__":
+    try: r = tk.Tk(); DriftMazeGame(r); r.mainloop()
+    except Exception: er = tk.Tk(); er.withdraw(); messagebox.showerror("Ошибка", traceback.format_exc())
